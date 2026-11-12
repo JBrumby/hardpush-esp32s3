@@ -11,10 +11,23 @@
 #include <WiFiUdp.h>
 #define APPLEMIDI_INITIATOR
 #include <AppleMIDI.h>
-#include <AppleMIDI.h>
+#include <BLEMIDI_Transport.h>
+#include <hardware/BLEMIDI_ESP32.h>
 #include <EspUsbHost.h>
 
 #include "secrets.h"
+
+
+// ===========================================================================
+//  TRANSPORT-KONFIGURATION (per Compiler-Directive)
+// ===========================================================================
+#define USE_WIFI_APPLEMIDI  0   // 1 = WLAN/AppleMIDI aktiv, 0 = deaktiviert
+#define USE_BLE_MIDI        1   // 1 = BLE-MIDI aktiv,       0 = deaktiviert
+// for both: Compiler directive CONFIG_ESP_COEX_SW_COEXIST_ENABLE must be set. 
+// in sdkconfig for PlatformIO. (Arduino IDE has set it by default)
+// ===========================================================================
+
+
 
 // ===========================================================================
 //  KONFIGURATION
@@ -30,7 +43,8 @@ const uint16_t REMOTE_PORT = 5004;
 // ===========================================================================
 //  INSTANZEN
 // ===========================================================================
-APPLEMIDI_CREATE_DEFAULTSESSION_INSTANCE();
+APPLEMIDI_CREATE_DEFAULTSESSION_INSTANCE(); // MIDI is Apple instance
+BLEMIDI_CREATE_INSTANCE("Hardpush-ESP32", MIDI_BLE); // MIDI_BLE is BLE instance
 EspUsbHost usbHost;
 
 // ===========================================================================
@@ -165,7 +179,8 @@ bool legalRange(byte value) { return value < 128; }
 
 void killAllPressedNotesDIN(byte channel) {
     for (int i = 0; i < 128; i++)
-        if (pressedNotes[i]) MIDI.sendNoteOff(i, 0, channel);
+        // if (pressedNotes[i]) MIDI.sendNoteOff(i, 0, channel);
+        if (pressedNotes[i]) sendNoteOffToAll(i, channel);
 }
 
 // ===========================================================================
@@ -320,8 +335,9 @@ byte getYlayout(byte pageIndex) { return layouts[pageLayouts[pageIndex]][1]; }
 //  CC-BEHANDLUNG (Push -> Laptop, per AppleMIDI)
 // ===========================================================================
 void handleCC(byte cc, byte val) {
-    if (cc == 64) {
-        MIDI.sendControlChange(64, val, pageChannels[instrumentPageIndex]);
+    if (cc == 64) { // Sustain
+        // vorher: MIDI.sendControlChange(64, val, pageChannels[instrumentPageIndex]);
+        sendControlChangeToAll(64, val, pageChannels[instrumentPageIndex]);
         return;
     }
     if (cc == 54 || cc == 55) {
@@ -454,6 +470,44 @@ void onAppleNoteOff(byte channel, byte pitch, byte velocity) {
         if (pitch == pushButtonIndexToAbsoluteNote(i)) displayButton(i, false);
 }
 
+
+//Push1 sending to ble or apple
+void sendNoteOnToAll(byte note, byte velocity, byte channel) {
+    #if USE_WIFI_APPLEMIDI
+        MIDI.sendNoteOn(note, velocity, channel);
+    #endif
+    #if USE_BLE_MIDI
+        MIDI_BLE.sendNoteOn(note, velocity, channel);
+    #endif
+}
+
+void sendNoteOffToAll(byte note, byte channel) {
+    #if USE_WIFI_APPLEMIDI
+        MIDI.sendNoteOff(note, 0, channel);
+    #endif
+    #if USE_BLE_MIDI
+        MIDI_BLE.sendNoteOff(note, 0, channel);
+    #endif
+}
+
+void sendControlChangeToAll(byte control, byte value, byte channel) {
+    #if USE_WIFI_APPLEMIDI
+        MIDI.sendControlChange(control, value, channel);
+    #endif
+    #if USE_BLE_MIDI
+        MIDI_BLE.sendControlChange(control, value, channel);
+    #endif
+}
+
+void sendPitchBendToAll(int bend, byte channel) {
+    #if USE_WIFI_APPLEMIDI
+        MIDI.sendPitchBend(bend, channel);
+    #endif
+    #if USE_BLE_MIDI
+        MIDI_BLE.sendPitchBend(bend, channel);
+    #endif
+}
+
 // ===========================================================================
 //  SETUP
 // ===========================================================================
@@ -462,6 +516,7 @@ void setup() {
     delay(300);
     Serial.println("=== hardpush ESP32-S3 (EspUsbHost + AppleMIDI) ===");
 
+  #if USE_WIFI_APPLEMIDI
     // --- WLAN ---
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
@@ -480,6 +535,21 @@ void setup() {
     MIDI.setHandleNoteOff(onAppleNoteOff);
     AppleMIDI.sendInvite(REMOTE_IP, REMOTE_PORT);
     Serial.println("[RTP] Invite an Laptop gesendet");
+  #else
+    Serial.println("[RTP] Appletalk per wlan is disabled in source code");
+  #endif
+
+
+
+  #if USE_BLE_MIDI
+    MIDI_BLE.begin(MIDI_CHANNEL_OMNI);
+    MIDI_BLE.setHandleNoteOn(onAppleNoteOn);
+    MIDI_BLE.setHandleNoteOff(onAppleNoteOff);
+    Serial.println("[BLE] BLE-MIDI gestartet, warte auf Verbindung...");
+  #else
+    Serial.println("[BLE] is disabled in source code");
+  #endif
+
 
     // --- USB-Host (EspUsbHost) ---
     usbQueue = xQueueCreate(32, sizeof(UsbEvent));
@@ -518,8 +588,13 @@ void setup() {
 //  LOOP
 // ===========================================================================
 void loop() {
-    // AppleMIDI-Empfang
-    MIDI.read();
+    
+    #if USE_WIFI_APPLEMIDI
+        MIDI.read();
+    #endif
+    #if USE_BLE_MIDI
+        MIDI_BLE.read();
+    #endif
 
     if (pushNeedsInit) {
         pushNeedsInit = false;
@@ -542,7 +617,8 @@ void loop() {
                 if (legalRange(mapped)) {
                     byte vel = ev.d2 * 20;
                     if (vel > 126) vel = 126;
-                    MIDI.sendNoteOn(mapped, vel, pageChannels[instrumentPageIndex]);
+                    // vorher: MIDI.sendNoteOn(mapped, vel, pageChannels[instrumentPageIndex]);
+                    sendNoteOnToAll(mapped, vel, pageChannels[instrumentPageIndex]);
                     pressedNotes[mapped] = true;
                 }
             }
@@ -553,7 +629,8 @@ void loop() {
             if (ev.d1 > 35 && ev.d1 < 100) {
                 byte mapped = pushButtonIndexToAbsoluteNote(ev.d1 - 36);
                 if (legalRange(mapped)) {
-                    MIDI.sendNoteOff(mapped, 0, pageChannels[instrumentPageIndex]);
+                    // vorher: MIDI.sendNoteOff(mapped, 0, pageChannels[instrumentPageIndex]);
+                    sendNoteOffToAll(mapped, pageChannels[instrumentPageIndex]);
                     pressedNotes[mapped] = false;
                 }
             }
@@ -565,7 +642,8 @@ void loop() {
 
         } else if (ev.type == EV_PITCH) {
             int bend = ((int)ev.d2 << 7) | ev.d1;
-            MIDI.sendPitchBend(bend - 8192, pageChannels[instrumentPageIndex]);
+            // vorher: MIDI.sendPitchBend(bend - 8192, pageChannels[instrumentPageIndex]);
+            sendPitchBendToAll(bend - 8192, pageChannels[instrumentPageIndex]);
 
         } else if (ev.type == EV_AT) {
             // Channel Pressure (0xD0) hat keine Convenience-Methode in AppleMIDI;
